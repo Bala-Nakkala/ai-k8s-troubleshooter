@@ -1,0 +1,325 @@
+AI-ASSISTED KUBERNETES TROUBLESHOOTING REPORT
+Generated UTC: 2026-10-10T10:41:21.472244+00:00
+Mode: Read-only diagnostics; no cluster changes made.
+
+=================================================================
+NAMESPACE: argocd
+POD: argocd-applicationset-controller-69bddf5587-4x5zc
+=================================================================
+### 1. Observed Symptoms
+* Pod `argocd-applicationset-controller-69bddf5587-4x5zc` is in `CrashLoopBackOff` status with a restart count of 2,484.
+* Container terminates with exit code 1.
+* Logs repeatedly report: `error: "failed to get restmapping: no matches for kind \"ApplicationSet\" in version \"argoproj.io/v1alpha1\""`.
+* Manager terminates after failing to sync caches: `timed out waiting for cache to be synced for Kind *v1alpha1.ApplicationSet`.
+
+---
+
+### 2. Possible Root Cause
+* **Missing or Misconfigured CRD:** The Custom Resource Definition (CRD) `applicationsets.argoproj.io` appears to be missing from the cluster or lacks the expected API version (`v1alpha1`).
+  * *Supporting Evidence:* Repeated log lines state `no matches for kind "ApplicationSet" in version "argoproj.io/v1alpha1"` and advise `if kind is a CRD, it should be installed before calling Start`.
+* **RBAC Discovery Restrictions:** Alternatively, the ServiceAccount running the controller might lack cluster-level permissions to discover or list CRDs.
+
+---
+
+### 3. Investigation Commands (Read-Only)
+Run the following commands to assess the CRD status and RBAC permissions:
+
+1. Check if the ApplicationSet CRD exists:
+   ```bash
+   kubectl get crd applicationsets.argoproj.io
+   ```
+2. Verify available API resources under the Argo CD API group:
+   ```bash
+   kubectl api-resources --api-group=argoproj.io
+   ```
+3. Check RBAC permissions for the controller's ServiceAccount:
+   ```bash
+   kubectl auth can-i list applicationsets.argoproj.io --as=system:serviceaccount:argocd:argocd-applicationset-controller
+   ```
+
+---
+
+### 4. Recommended Remediation and Risks
+* **Remediation:**
+  * If the CRD is missing, apply the official `applicationsets.argoproj.io` CRD corresponding to Argo CD version `v3.4.5` (e.g., from the official Argo CD manifests).
+  * If the CRD is present, ensure correct ClusterRole and ClusterRoleBinding permissions are bound to the `argocd-applicationset-controller` ServiceAccount.
+* **Risks:**
+  * Installing or updating CRDs impacts all namespaces and controllers consuming that API.
+  * Applying the incorrect version of the CRD manifest could introduce schema incompatibilities with existing manifests or controller expectations.
+
+---
+
+### 5. Pre-Change Verification
+Before applying changes, verify:
+* Whether the CRD was previously installed and deleted, or if this is a fresh installation that omitted CRDs.
+* The exact Argo CD version deployed across all components to ensure version compatibility (`v3.4.5` indicated in logs).
+* Whether other Argo CD CRDs (e.g., `applications.argoproj.io`, `appprojects.argoproj.io`) are installed and healthy.
+
+
+=================================================================
+NAMESPACE: argocd
+POD: argocd-server-c775fbbdd-clbp8
+=================================================================
+### 1. Observed Symptoms
+* **High Restart Count:** The `argocd-server` container has restarted 10 times.
+* **Exit Code 143:** The previous termination status was an error with exit code 143 (indicating the process was terminated by `SIGTERM`, typically due to pod deletion, eviction, or liveness probe failure).
+* **Repeated API Discovery/Watch Errors:** Continuous error logs indicating client-go reflectors cannot watch or list `*v1alpha1.ApplicationSet`: `"the server could not find the requested resource (get applicationsets.argoproj.io)"`.
+
+---
+
+### 2. Possible Root Cause
+* **Missing or Unregistered ApplicationSet CustomResourceDefinition (CRD):**
+  * *Evidence:* Logs explicitly report `the server could not find the requested resource (get applicationsets.argoproj.io)`. The `argocd-server` pod is attempting to watch ApplicationSets, but the Kubernetes API server does not have the `applicationsets.argoproj.io` resource registered.
+* **Liveness Probe Failure Leading to Termination:**
+  * *Evidence:* Exit code 143 indicates graceful termination via `SIGTERM`. If the missing CRD causes startup/readiness/liveness probes to fail or causes a controller routine to deadlock/block leading to kubelet timeouts, the kubelet may be repeatedly killing and restarting the container.
+
+---
+
+### 3. Three Read-Only Investigation Commands
+```bash
+# Check if the ApplicationSet CRD is installed in the cluster
+kubectl get crd applicationsets.argoproj.io
+
+# Inspect pod configuration, probe definitions, and termination events
+kubectl describe pod argocd-server-c775fbbdd-clbp8 -n argocd
+
+# Check recent termination logs and reason from the previous container instance
+kubectl logs argocd-server-c775fbbdd-clbp8 -n argocd -c argocd-server --previous --tail=100
+```
+
+---
+
+### 4. Recommended Remediation and Risks
+* **Remediation:**
+  1. Apply the missing Argo CD CRDs (specifically `applicationsets.argoproj.io`) matching the installed Argo CD version:
+     `kubectl apply -k https://github.com/argoproj/argo-cd/manifests/crds?ref=<installed-version>`
+  2. Alternatively, if ApplicationSets are intentionally not used, disable the ApplicationSet controller or related features in the `argocd-server` deployment/config flags if supported by your version.
+* **Risks:**
+  * Applying CRDs from a mismatched Argo CD version can introduce schema conflicts or break other components.
+  * Modifying deployment flags or manifests can cause rolling restarts or downtime for the Argo CD API and UI.
+
+---
+
+### 5. What Should Be Verified Before Making Changes
+1. **Installed Argo CD Version:** Check the exact image tag and version of `argocd-server` to match the exact CRD definitions.
+2. **Cluster-Wide CRDs:** Verify whether other Argo CD CRDs (e.g., `applications.argoproj.io`, `appprojects.argoproj.io`) exist or if this was an incomplete/partial installation.
+3. **True Termination Cause:** Verify `kubectl describe pod` events to confirm whether exit code 143 was caused by a liveness probe failure, a manual rollout, or node eviction rather than an internal panic.
+
+
+=================================================================
+NAMESPACE: ingress-nginx
+POD: ingress-nginx-controller-f5784567-6jptb
+=================================================================
+### 1. Observed Symptoms
+* The controller container is currently `Ready: True`, but has an exceptionally high restart count (`356`).
+* The previous container instance terminated with exit code `143` (SIGTERM).
+* Based on timestamps between container starts (~09:34:14 to ~09:35:09), restarts appear to recur roughly every minute.
+* Application logs show normal initialization and leader election without application-level panic or crash stack traces.
+
+### 2. Possible Root Cause, with Supporting Evidence
+* **Liveness or Startup Probe Failure:**
+  * *Evidence:* Exit code `143` indicates the process received a `SIGTERM` signal, which is standard kubelet behavior when terminating a container that has failed its liveness or startup probe threshold. The ~55-second lifetime between restarts matches typical probe initial delay and failure threshold intervals.
+* **External Graceful Termination:**
+  * *Evidence:* An external controller, node pressure, or eviction process could be sending a graceful shutdown signal, though the rapid loop of restarts makes probe failure more likely.
+
+### 3. Three Read-Only Investigation Commands
+```bash
+# 1. Inspect probe definitions, container status, and recent pod-level events
+kubectl describe pod ingress-nginx-controller-f5784567-6jptb -n ingress-nginx
+
+# 2. Check namespace events to identify Unhealthy probe warnings or killing events
+kubectl get events -n ingress-nginx --sort-by='.metadata.creationTimestamp'
+
+# 3. View the final logs of the previous container instance prior to receiving SIGTERM
+kubectl logs ingress-nginx-controller-f5784567-6jptb -n ingress-nginx -c controller --previous --tail=100
+```
+
+### 4. Recommended Remediation and Risks
+* **Remediation:**
+  * If probes are failing due to slow startup or transient latency, increase `initialDelaySeconds`, `timeoutSeconds`, or `failureThreshold` on the liveness/startup probe in the Ingress Controller Deployment/DaemonSet.
+  * If probe endpoints fail due to CPU starvation/throttling, adjust container CPU requests and limits.
+  * If the probe endpoint (e.g., `/healthz`) is misconfigured or inaccessible, correct the port/path configuration.
+* **Risks:**
+  * Modifying the controller spec triggers a rolling update, which may cause temporary routing interruptions if no other healthy replicas are running.
+  * Overly relaxed probe thresholds may delay automatic recovery if the controller genuinely hangs or deadlocks in the future.
+
+### 5. What Should Be Verified Before Making Changes
+* Confirm in `kubectl describe pod` whether kubelet recorded `Unhealthy` events targeting liveness/startup probes.
+* Verify whether the health endpoint (typically port 10254 `/healthz`) responds successfully before the restart interval elapses.
+* Verify replica count and high availability configuration of the ingress controller to prevent downtime during any updates.
+
+============================================================
+AI-ASSISTED KUBERNETES TROUBLESHOOTING REPORT
+Time (UTC): 2026-10-10T11:33:42.015227+00:00
+Namespace: jenkins
+Pod: springboot-demo-78647c6d96-2dx8w
+============================================================
+
+SANITIZED DIAGNOSTICS
+{
+  "collected_at_utc": "2026-10-10T11:33:27.265226+00:00",
+  "namespace": "jenkins",
+  "pod_name": "springboot-demo-78647c6d96-2dx8w",
+  "phase": "Running",
+  "node_name": "balu-lab-worker",
+  "container_diagnostics": [
+    {
+      "container": "springboot-demo",
+      "ready": true,
+      "restart_count": 82,
+      "waiting_reason": null,
+      "termination_reason": "Unknown",
+      "exit_code": 255,
+      "selected_error_lines": []
+    }
+  ],
+  "recent_events": []
+}
+
+AI ANALYSIS / SECURITY STATUS
+### 1. Observed Symptoms
+* **High Restart Count:** The `springboot-demo` container has restarted **82 times**.
+* **Exit Code 255:** The container’s previous termination exited with code `255` and a termination reason of `Unknown`.
+* **Currently Healthy / Running:** The pod is currently in the `Running` phase and the container status is `ready: true`, indicating the issue is intermittent or the container is in a temporary running state between failures.
+* **Missing Log Context:** The provided diagnostic payload contains no recent events or error lines, so immediate log-level context is unavailable.
+
+---
+
+### 2. Possible Root Causes (Ranked by Likelihood)
+1. **Application / JVM Unhandled Exception or Fatal Exit (Most Likely):**
+   In Java / Spring Boot applications, an explicit `System.exit(-1)` maps to exit code `255`. This often happens during failed database connection handshakes, misconfigured application contexts, or unhandled exceptions in background threads.
+2. **Container Entrypoint / Wrapper Script Failure:**
+   If the container uses a shell wrapper script (e.g., `entrypoint.sh`) that executes subcommands or pre-start validation, a failing command inside that script can bubble up an exit code of `255`.
+3. **Misconfigured Health Probes:**
+   If a custom `exec` liveness probe fails or times out, it could return exit code 255. Alternatively, overly aggressive HTTP/TCP liveness probes might be killing the application intermittently under load.
+4. **Node or Runtime Issues (Less Likely):**
+   Transient runtime issues on the node `balu-lab-worker` could cause container exits, though usually accompanied by specific runtime events or exit codes (such as 137 for OOMKilled).
+
+---
+
+### 3. Three Read-Only Commands to Investigate
+
+1. **Inspect previous container logs for termination cause:**
+   ```bash
+   kubectl logs -n jenkins springboot-demo-78647c6d96-2dx8w -c springboot-demo --previous --tail=100
+   ```
+2. **Check detailed pod configuration, probe settings, and last termination state:**
+   ```bash
+   kubectl get pod -n jenkins springboot-demo-78647c6d96-2dx8w -o yaml
+   ```
+3. **Inspect historical events associated with this specific pod:**
+   ```bash
+   kubectl get events -n jenkins --field-selector involvedObject.name=springboot-demo-78647c6d96-2dx8w --sort-by='.lastTimestamp'
+   ```
+
+---
+
+### 4. Suggested Remediation, Risks, and Approvals
+
+* **Suggested Remediation:**
+  * Review the application stack trace from the `--previous` logs to determine why the Spring Boot application or its entrypoint exits with code 255.
+  * Adjust application properties, external dependency configurations (e.g., database connection pool, service endpoints), or probe timeouts in the workload definition (Deployment/StatefulSet) as required.
+* **Risks:**
+  * Updating workload manifests triggers a rolling update, which could cause service downtime if the underlying root cause is not correctly resolved.
+* **Approval Needed:**
+  * Coordinate with the application development team (for Java/Spring Boot behavior) and the platform/DevOps team (for deployment and cluster resource configuration changes) prior to applying any manifest updates.
+
+---
+
+### 5. Verification Steps After an Authorized Fix
+
+1. **Monitor Restart Count:**
+   Verify that the pod's restart count remains stable and does not increment over a sustained period:
+   ```bash
+   kubectl get pod -n jenkins -l app=springboot-demo -w
+   ```
+2. **Check Probe and Container Health:**
+   Confirm that all probes (liveness, readiness, startup) are passing consistently:
+   ```bash
+   kubectl describe pod -n jenkins -l app=springboot-demo
+   ```
+3. **Validate Current Application Logs:**
+   Ensure application initialization completes cleanly without warnings or connection retries:
+   ```bash
+   kubectl logs -n jenkins -l app=springboot-demo --tail=50
+   ```
+
+IMPORTANT:
+This report contains suggestions, not a confirmed root cause.
+Review recommendations before taking any action.
+No Kubernetes changes were performed by this script.
+
+
+============================================================
+AI-ASSISTED KUBERNETES TROUBLESHOOTING REPORT
+Time (UTC): 2026-10-10T11:41:00.170789+00:00
+Namespace: jenkins
+Pod: springboot-demo-78647c6d96-2dx8w
+============================================================
+
+SANITIZED DIAGNOSTICS
+{
+  "collected_at_utc": "2026-10-10T11:40:58.404045+00:00",
+  "namespace": "jenkins",
+  "pod_name": "springboot-demo-78647c6d96-2dx8w",
+  "phase": "Running",
+  "node_name": "balu-lab-worker",
+  "container_diagnostics": [
+    {
+      "container": "springboot-demo",
+      "ready": true,
+      "restart_count": 82,
+      "waiting_reason": null,
+      "termination_reason": "Unknown",
+      "exit_code": 255,
+      "selected_error_lines": []
+    }
+  ],
+  "recent_events": []
+}
+
+AI ANALYSIS / SECURITY STATUS
+Gemini API request failed. Error type: ServerError. Check API access and model availability.
+
+IMPORTANT:
+This report contains suggestions, not a confirmed root cause.
+Review recommendations before taking any action.
+No Kubernetes changes were performed by this script.
+
+
+============================================================
+AI-ASSISTED KUBERNETES TROUBLESHOOTING REPORT
+Time (UTC): 2026-10-10T11:43:49.313581+00:00
+Namespace: jenkins
+Pod: springboot-demo-78647c6d96-2dx8w
+============================================================
+
+SANITIZED DIAGNOSTICS
+{
+  "collected_at_utc": "2026-10-10T11:43:47.277636+00:00",
+  "namespace": "jenkins",
+  "pod_name": "springboot-demo-78647c6d96-2dx8w",
+  "phase": "Running",
+  "node_name": "balu-lab-worker",
+  "container_diagnostics": [
+    {
+      "container": "springboot-demo",
+      "ready": true,
+      "restart_count": 82,
+      "waiting_reason": null,
+      "termination_reason": "Unknown",
+      "exit_code": 255,
+      "selected_error_lines": []
+    }
+  ],
+  "recent_events": []
+}
+
+AI ANALYSIS / SECURITY STATUS
+Gemini API request failed. Error type: ServerError. Check API access and model availability.
+
+IMPORTANT:
+This report contains suggestions, not a confirmed root cause.
+Review recommendations before taking any action.
+No Kubernetes changes were performed by this script.
+
